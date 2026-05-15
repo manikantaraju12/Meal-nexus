@@ -1,0 +1,20 @@
+version = 0.1
+
+[default.global.parameters]
+region = "us-east-1"
+
+[dev.deploy.parameters]
+stack_name = "mealnexus-dev"
+resolve_s3 = true
+s3_prefix = "mealnexus-dev"
+confirm_changeset = false
+capabilities = "CAPABILITY_NAMED_IAM"
+parameter_overrides = "Environment=dev DomainName="
+
+[prod.deploy.parameters]
+stack_name = "mealnexus-prod"
+resolve_s3 = true
+s3_prefix = "mealnexus-prod"
+confirm_changeset = false
+capabilities = "CAPABILITY_NAMED_IAM"
+parameter_overrides = "Environment=prod DomainName=mealnexus.me HostedZoneId=Z01164992EG1TKXV1T7U2 CertificateArn=arn:aws:acm:us-east-1:936408601104:certificate/ce6d0ae9-4cc2-4867-b4cd-47c307b98768"

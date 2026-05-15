@@ -1,0 +1,593 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: MealNexus AWS Infrastructure
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+    - dev
+    - staging
+    - prod
+Resources:
+  MealNexusBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: mealnexus-${Environment}-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+        - AllowedHeaders:
+          - '*'
+          AllowedMethods:
+          - GET
+          - PUT
+          - POST
+          AllowedOrigins:
+          - '*'
+          MaxAge: 3600
+  DonationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName:
+        Fn::Sub: mealnexus-donation-events-${Environment}
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn:
+          Fn::GetAtt:
+          - DonationDLQ
+          - Arn
+        maxReceiveCount: 3
+  DonationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName:
+        Fn::Sub: mealnexus-donation-events-dlq-${Environment}
+      MessageRetentionPeriod: 1209600
+  NgoNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName:
+        Fn::Sub: mealnexus-ngo-notifications-${Environment}
+  VolunteerNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName:
+        Fn::Sub: mealnexus-volunteer-notifications-${Environment}
+  AiRankingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: mealnexus-ai-ranking-${Environment}
+      CodeUri: 
+        s3://mealnexus-dev-936408601104-us-east-1/0b680dfd9bca1c2ca6a9be837fbda6ff
+      Handler: lambda_ranking.lambda_handler
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 512
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /rank
+            Method: post
+            RestApiId:
+              Ref: AiApiGateway
+  AiApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name:
+        Fn::Sub: mealnexus-ai-api-${Environment}
+      StageName:
+        Ref: Environment
+      Cors:
+        AllowMethods: "'POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+  BackendRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName:
+        Fn::Sub: mealnexus-backend-${Environment}
+      ImageScanningConfiguration:
+        ScanOnPush: true
+  FrontendRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName:
+        Fn::Sub: mealnexus-frontend-${Environment}
+      ImageScanningConfiguration:
+        ScanOnPush: true
+  SageMakerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName:
+        Fn::Sub: mealnexus-sagemaker-ranking
+      ImageScanningConfiguration:
+        ScanOnPush: true
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: mealnexus-sagemaker-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: sagemaker.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+  BackendSageMakerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName:
+        Fn::Sub: mealnexus-backend-sagemaker-policy-${Environment}
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - sagemaker:InvokeEndpoint
+          Resource: '*'
+      Roles:
+      - Ref: EcsTaskRole
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName:
+        Fn::Sub: mealnexus-${Environment}
+      CapacityProviders:
+      - FARGATE
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: MealNexusTaskPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+            Resource:
+              Fn::GetAtt:
+              - DonationQueue
+              - Arn
+          - Effect: Allow
+            Action:
+            - sns:Publish
+            Resource:
+            - Ref: NgoNotificationTopic
+            - Ref: VolunteerNotificationTopic
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:DeleteObject
+            Resource:
+              Fn::Sub: arn:aws:s3:::${MealNexusBucket}/*
+          - Effect: Allow
+            Action:
+            - sagemaker:InvokeEndpoint
+            Resource: '*'
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: mealnexus-vpc-${Environment}
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: mealnexus-igw-${Environment}
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: VPC
+      InternetGatewayId:
+        Ref: InternetGateway
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone:
+        Fn::Select:
+        - 0
+        - Fn::GetAZs: ''
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: mealnexus-public-1-${Environment}
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone:
+        Fn::Select:
+        - 1
+        - Fn::GetAZs: ''
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: mealnexus-public-2-${Environment}
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: VPC
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: mealnexus-rt-${Environment}
+  Route:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId:
+        Ref: RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+  SubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PublicSubnet1
+      RouteTableId:
+        Ref: RouteTable
+  SubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PublicSubnet2
+      RouteTableId:
+        Ref: RouteTable
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for MealNexus backend
+      VpcId:
+        Ref: VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 5000
+        ToPort: 5000
+        SourceSecurityGroupId:
+          Ref: AlbSecurityGroup
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: mealnexus-backend-sg-${Environment}
+  FrontendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for MealNexus frontend
+      VpcId:
+        Ref: VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        SourceSecurityGroupId:
+          Ref: AlbSecurityGroup
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: mealnexus-frontend-sg-${Environment}
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ALB
+      VpcId:
+        Ref: VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: mealnexus-alb-sg-${Environment}
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name:
+        Fn::Sub: mealnexus-alb-${Environment}
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+      - Ref: PublicSubnet1
+      - Ref: PublicSubnet2
+      SecurityGroups:
+      - Ref: AlbSecurityGroup
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: mealnexus-alb-${Environment}
+  AlbTargetGroupBackend:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name:
+        Fn::Sub: mealnexus-backend-tg-${Environment}
+      Port: 5000
+      Protocol: HTTP
+      VpcId:
+        Ref: VPC
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+  AlbTargetGroupFrontend:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name:
+        Fn::Sub: mealnexus-frontend-tg-${Environment}
+      Port: 80
+      Protocol: HTTP
+      VpcId:
+        Ref: VPC
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn:
+        Ref: ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: AlbTargetGroupFrontend
+  AlbApiPathRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn:
+        Ref: AlbListener
+      Priority: 1
+      Conditions:
+      - Field: path-pattern
+        PathPatternConfig:
+          Values:
+          - /api/*
+      Actions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: AlbTargetGroupBackend
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family:
+        Fn::Sub: mealnexus-backend-${Environment}
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+      - FARGATE
+      Cpu: 512
+      Memory: 1024
+      ExecutionRoleArn:
+        Fn::GetAtt:
+        - EcsExecutionRole
+        - Arn
+      TaskRoleArn:
+        Fn::GetAtt:
+        - EcsTaskRole
+        - Arn
+      ContainerDefinitions:
+      - Name: backend
+        Image:
+          Fn::Sub: 
+            ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendRepository}:latest
+        PortMappings:
+        - ContainerPort: 5000
+        Environment:
+        - Name: NODE_ENV
+          Value:
+            Ref: Environment
+        - Name: PORT
+          Value: '5000'
+        - Name: SQS_QUEUE_URL
+          Value:
+            Ref: DonationQueue
+        - Name: SNS_NGO_TOPIC_ARN
+          Value:
+            Ref: NgoNotificationTopic
+        - Name: SNS_VOLUNTEER_TOPIC_ARN
+          Value:
+            Ref: VolunteerNotificationTopic
+        - Name: S3_BUCKET_NAME
+          Value:
+            Ref: MealNexusBucket
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group:
+              Ref: BackendLogGroup
+            awslogs-region:
+              Ref: AWS::Region
+            awslogs-stream-prefix: backend
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family:
+        Fn::Sub: mealnexus-frontend-${Environment}
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+      - FARGATE
+      Cpu: 256
+      Memory: 512
+      ExecutionRoleArn:
+        Fn::GetAtt:
+        - EcsExecutionRole
+        - Arn
+      ContainerDefinitions:
+      - Name: frontend
+        Image:
+          Fn::Sub: 
+            ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${FrontendRepository}:latest
+        PortMappings:
+        - ContainerPort: 80
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group:
+              Ref: FrontendLogGroup
+            awslogs-region:
+              Ref: AWS::Region
+            awslogs-stream-prefix: frontend
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /ecs/mealnexus-backend-${Environment}
+      RetentionInDays: 30
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /ecs/mealnexus-frontend-${Environment}
+      RetentionInDays: 30
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn: AlbListener
+    Properties:
+      ServiceName:
+        Fn::Sub: mealnexus-backend-${Environment}
+      Cluster:
+        Ref: EcsCluster
+      TaskDefinition:
+        Ref: BackendTaskDefinition
+      DesiredCount: 0
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+          - Ref: BackendSecurityGroup
+          Subnets:
+          - Ref: PublicSubnet1
+          - Ref: PublicSubnet2
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+      - ContainerName: backend
+        ContainerPort: 5000
+        TargetGroupArn:
+          Ref: AlbTargetGroupBackend
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn: AlbListener
+    Properties:
+      ServiceName:
+        Fn::Sub: mealnexus-frontend-${Environment}
+      Cluster:
+        Ref: EcsCluster
+      TaskDefinition:
+        Ref: FrontendTaskDefinition
+      DesiredCount: 0
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+          - Ref: FrontendSecurityGroup
+          Subnets:
+          - Ref: PublicSubnet1
+          - Ref: PublicSubnet2
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+      - ContainerName: frontend
+        ContainerPort: 80
+        TargetGroupArn:
+          Ref: AlbTargetGroupFrontend
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+Outputs:
+  ApiGatewayUrl:
+    Description: API Gateway endpoint URL
+    Value:
+      Fn::Sub: 
+        https://${AiApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/rank
+  S3BucketName:
+    Description: S3 bucket for assets
+    Value:
+      Ref: MealNexusBucket
+  SQSQueueUrl:
+    Description: SQS queue URL for donation events
+    Value:
+      Ref: DonationQueue
+  NGOTopicArn:
+    Description: SNS topic ARN for NGO notifications
+    Value:
+      Ref: NgoNotificationTopic
+  VolunteerTopicArn:
+    Description: SNS topic ARN for volunteer notifications
+    Value:
+      Ref: VolunteerNotificationTopic
+  SageMakerRepositoryUri:
+    Description: ECR URI for SageMaker ranking image
+    Value:
+      Fn::Sub: 
+        ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${SageMakerRepository}
+  SageMakerExecutionRoleArn:
+    Description: IAM role ARN for SageMaker execution
+    Value:
+      Fn::GetAtt:
+      - SageMakerExecutionRole
+      - Arn

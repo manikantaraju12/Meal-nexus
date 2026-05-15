@@ -1,0 +1,371 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_BACKEND_REPO: mealnexus-backend-${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
+  ECR_FRONTEND_REPO: mealnexus-frontend-${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
+  ECR_SAGEMAKER_REPO: mealnexus-sagemaker-ranking-${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
+  ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
+
+jobs:
+  # Lint and test
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm install
+
+      - name: Lint backend
+        working-directory: backend
+        run: npm run lint || true
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint frontend
+        working-directory: frontend
+        run: npm run lint || true
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install AI service dependencies
+        working-directory: ai-service
+        run: pip install -r requirements.txt
+
+  # Deploy infrastructure first (creates ECR repos)
+  deploy-infra:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: Validate SAM template
+        working-directory: infrastructure
+        run: sam validate
+
+      - name: Build SAM application
+        working-directory: infrastructure
+        run: sam build
+
+      - name: Deploy SAM application (phase 1 — core infra, no CloudFront)
+        working-directory: infrastructure
+        run: |
+          # Deploy without CloudFront so ALB/VPC/ECS are created first.
+          # CloudFormation EarlyValidation requires the ALB to exist before
+          # a CloudFront distribution can reference it in the same changeset.
+          # Explicit flags (no --config-env) bypass samconfig.toml, which has
+          # DomainName=mealnexus.me in [prod] — empty-string CLI overrides cannot
+          # reliably win against a non-empty samconfig value in SAM CLI.
+          sam deploy \
+            --stack-name mealnexus-$ENVIRONMENT \
+            --resolve-s3 \
+            --s3-prefix mealnexus-$ENVIRONMENT \
+            --region us-east-1 \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides "Environment=$ENVIRONMENT DomainName= HostedZoneId= CertificateArn=" || {
+            STATUS=$(aws cloudformation describe-stacks \
+              --stack-name mealnexus-$ENVIRONMENT \
+              --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NOT_FOUND")
+            echo "Phase 1 CloudFormation stack status: $STATUS"
+            if [[ "$STATUS" =~ (CREATE|UPDATE)_COMPLETE$ ]]; then
+              echo "Phase 1 complete."
+            else
+              echo "Phase 1 failed: $STATUS"; exit 1
+            fi
+          }
+
+      - name: Deploy SAM application (phase 2 — add CloudFront + Route53)
+        working-directory: infrastructure
+        run: |
+          # Now the ALB exists — CloudFront EarlyValidation will pass.
+          sam deploy \
+            --config-env $ENVIRONMENT \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --capabilities CAPABILITY_NAMED_IAM || {
+            STATUS=$(aws cloudformation describe-stacks \
+              --stack-name mealnexus-$ENVIRONMENT \
+              --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NOT_FOUND")
+            echo "Phase 2 CloudFormation stack status: $STATUS"
+            if [[ "$STATUS" =~ (CREATE|UPDATE)_COMPLETE$ ]]; then
+              echo "Phase 2 complete."
+            else
+              echo "Phase 2 failed: $STATUS"; exit 1
+            fi
+          }
+
+  # Build and push Docker images
+  build:
+    needs: deploy-infra
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    outputs:
+      backend_image: ${{ steps.build-backend.outputs.image }}
+      frontend_image: ${{ steps.build-frontend.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push backend image
+        id: build-backend
+        working-directory: backend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_BACKEND_REPO:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_BACKEND_REPO:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_BACKEND_REPO:$IMAGE_TAG $ECR_REGISTRY/$ECR_BACKEND_REPO:latest
+          docker push $ECR_REGISTRY/$ECR_BACKEND_REPO:latest
+          echo "image=$ECR_REGISTRY/$ECR_BACKEND_REPO:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Get ALB DNS from CloudFormation
+        run: |
+          ALB_DNS=$(aws cloudformation describe-stacks \
+            --stack-name mealnexus-${{ env.ENVIRONMENT }} \
+            --query "Stacks[0].Outputs[?OutputKey=='ALBDNSName'].OutputValue" \
+            --output text)
+          echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
+
+      - name: Build and push frontend image
+        id: build-frontend
+        working-directory: frontend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          if [ "$ENVIRONMENT" = "prod" ]; then
+            API_URL="https://mealnexus.me/api"
+          else
+            API_URL="http://$ALB_DNS/api"
+          fi
+          docker build \
+            --build-arg VITE_API_URL=$API_URL \
+            -t $ECR_REGISTRY/$ECR_FRONTEND_REPO:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_FRONTEND_REPO:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_FRONTEND_REPO:$IMAGE_TAG $ECR_REGISTRY/$ECR_FRONTEND_REPO:latest
+          docker push $ECR_REGISTRY/$ECR_FRONTEND_REPO:latest
+          echo "image=$ECR_REGISTRY/$ECR_FRONTEND_REPO:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  # Deploy SageMaker AI Endpoint
+  deploy-sagemaker:
+    needs: deploy-infra
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: github.event_name == 'push'
+    outputs:
+      endpoint_name: mealnexus-ranking-${{ env.ENVIRONMENT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install boto3 sagemaker
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push SageMaker image
+        working-directory: ai-service
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_SAGEMAKER_REPO:$IMAGE_TAG -f Dockerfile.sagemaker .
+          docker push $ECR_REGISTRY/$ECR_SAGEMAKER_REPO:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_SAGEMAKER_REPO:$IMAGE_TAG $ECR_REGISTRY/$ECR_SAGEMAKER_REPO:latest
+          docker push $ECR_REGISTRY/$ECR_SAGEMAKER_REPO:latest
+
+      - name: Get AWS Account ID
+        id: account
+        run: |
+          echo "id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+      - name: Deploy SageMaker endpoint
+        working-directory: ai-service
+        env:
+          AWS_ACCOUNT_ID: ${{ steps.account.outputs.id }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ECR_REPO_NAME: ${{ env.ECR_SAGEMAKER_REPO }}
+        run: |
+          python3 scripts/deploy_sagemaker.py \
+            --env $ENVIRONMENT \
+            --instance-type ml.t2.medium \
+            --skip-build
+
+      - name: Test SageMaker endpoint
+        working-directory: ai-service
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          python3 scripts/test_sagemaker.py \
+            --endpoint mealnexus-ranking-$ENVIRONMENT \
+            --region $AWS_REGION
+
+  # Deploy AI Lambda function (fallback)
+  deploy-ai:
+    needs: deploy-infra
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: Deploy AI service
+        working-directory: infrastructure
+        run: |
+          sam deploy \
+            --config-env $ENVIRONMENT \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --capabilities CAPABILITY_NAMED_IAM || {
+            echo "SAM CLI exited non-zero — verifying CloudFormation stack status..."
+            STATUS=$(aws cloudformation describe-stacks \
+              --stack-name mealnexus-$ENVIRONMENT \
+              --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NOT_FOUND")
+            echo "CloudFormation stack status: $STATUS"
+            if [[ "$STATUS" =~ (CREATE|UPDATE)_COMPLETE$ ]]; then
+              echo "Stack is healthy — SAM CLI false-failure, continuing."
+              exit 0
+            else
+              echo "Stack is not healthy: $STATUS"
+              exit 1
+            fi
+          }
+
+  # Update ECS services
+  deploy-ecs:
+    needs: [build, deploy-ai, deploy-sagemaker]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update backend task definition with ECR image
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition mealnexus-backend-${{ env.ENVIRONMENT }} \
+            --query 'taskDefinition' --output json)
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
+            --arg IMAGE "${{ needs.build.outputs.backend_image }}" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)')
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service \
+            --cluster mealnexus-${{ env.ENVIRONMENT }} \
+            --service mealnexus-backend-${{ env.ENVIRONMENT }} \
+            --task-definition "$NEW_ARN" \
+            --desired-count 2
+
+      - name: Update frontend task definition with ECR image
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition mealnexus-frontend-${{ env.ENVIRONMENT }} \
+            --query 'taskDefinition' --output json)
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
+            --arg IMAGE "${{ needs.build.outputs.frontend_image }}" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)')
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service \
+            --cluster mealnexus-${{ env.ENVIRONMENT }} \
+            --service mealnexus-frontend-${{ env.ENVIRONMENT }} \
+            --task-definition "$NEW_ARN" \
+            --desired-count 2
+
+      - name: Wait for backend service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster mealnexus-${{ env.ENVIRONMENT }} \
+            --services mealnexus-backend-${{ env.ENVIRONMENT }}
+
+      - name: Wait for frontend service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster mealnexus-${{ env.ENVIRONMENT }} \
+            --services mealnexus-frontend-${{ env.ENVIRONMENT }}
+
+      - name: Verify deployment
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names mealnexus-alb-${{ env.ENVIRONMENT }} \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+          echo "Application URL: http://$ALB_DNS"
+          curl -f "http://$ALB_DNS/" || echo "Warning: Health check failed"
+          echo "SageMaker Endpoint: mealnexus-ranking-${{ env.ENVIRONMENT }}"

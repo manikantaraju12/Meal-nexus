@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\Karthik\\\\Desktop\\\\meal-nexus-main\" -Recurse -Force)",
+      "Bash(Select-Object FullName)",
+      "Bash(Head -100)",
+      "PowerShell(taskkill /F /IM node.exe 2>&1)",
+      "PowerShell(exit 0)",
+      "Bash(npm run *)",
+      "Bash(node setup-aws.js)",
+      "Bash(pip install *)"
+    ]
+  }
+}

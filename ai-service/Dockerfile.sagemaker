@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+# Install dependencies
+RUN pip install --no-cache-dir flask gunicorn
+
+# Set working directory
+WORKDIR /opt/ml/code
+
+# Copy serving code
+COPY sagemaker_serving.py /opt/ml/code/
+
+# SageMaker containers must listen on port 8080
+ENV SAGEMAKER_BIND_TO_PORT=8080
+
+# Use gunicorn for production serving
+# SageMaker sends requests to /invocations and health checks to /ping
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "--workers", "4", "--threads", "2", "--timeout", "60", "sagemaker_serving:app"]
